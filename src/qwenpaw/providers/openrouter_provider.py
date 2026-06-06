@@ -353,4 +353,5 @@ class OpenRouterProvider(Provider):
                 "base_url": self.base_url,
                 "default_headers": self._build_default_headers(),
             },
+            generate_kwargs=self.get_effective_generate_kwargs(model_id),
         )
