@@ -1801,6 +1801,166 @@ class MatrixChannel(BaseChannel):
         """Drop the buffered history for *room_id*."""
         self._room_histories.pop(room_id, None)
 
+    @staticmethod
+    def _build_quoted_prefix(
+        quoted: Dict[str, Any],
+    ) -> Optional[str]:
+        """Render an inline placeholder for a quoted (m.in_reply_to) message.
+
+        Mirrors ``YuanbaoChannel._build_quoted_prefix`` (see
+        ``tests/unit/channels/test_yuanbao.py::TestBuildQuotedPrefix``)
+        so the LLM sees a consistent ``[quoted <kind>: <body>]`` label
+        regardless of channel.
+
+        Args:
+            quoted: Dict produced by :meth:`_fetch_quoted_message`.
+                Must contain at least ``msgtype``; ``body`` is optional.
+
+        Returns:
+            Bracketed placeholder string, or ``None`` when *quoted* is
+            not a dict (so callers can use ``or ""`` to fall back).
+        """
+        if not isinstance(quoted, dict):
+            return None
+        msgtype = quoted.get("msgtype", "m.text")
+        body = (quoted.get("body") or "").strip()
+        # Matrix msgtype -> yuanbao-style label so wording stays
+        # consistent with other channels' quoted-message placeholders.
+        label = {
+            "m.text": "message",
+            "m.image": "image",
+            "m.file": "file",
+            "m.audio": "audio",
+            "m.video": "video",
+        }.get(msgtype, "message")
+        if body:
+            return f"[quoted {label}: {body}]"
+        return f"[quoted {label}]"
+
+    async def _fetch_quoted_message(
+        self,
+        room_id: str,
+        event_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch a quoted (replied-to) message via Matrix API.
+
+        Uses ``room_get_event`` to pull the full event content so the
+        reply can carry quoted text AND any media (image / file / audio /
+        video) along with encryption keys when the original was E2EE.
+
+        Args:
+            room_id: Matrix room id containing the quoted event.
+            event_id: Event id of the quoted message.
+
+        Returns:
+            Dict with at least ``sender``, ``body``, ``event_id``,
+            ``msgtype``; media messages additionally include ``url``,
+            ``info``, and (for E2EE) ``key``/``hashes``/``iv``/
+            ``encrypted=True``. Returns ``None`` on failure.
+        """
+        if not self._client:
+            logger.debug("_fetch_quoted_message: client not available")
+            return None
+        try:
+            resp = await self._client.room_get_event(room_id, event_id)
+            from nio.responses import RoomGetEventError, RoomGetEventResponse
+
+            if isinstance(resp, RoomGetEventError):
+                logger.debug(
+                    "_fetch_quoted_message: error fetching event %s in %s: %s",
+                    event_id,
+                    room_id,
+                    getattr(resp, "message", ""),
+                )
+                return None
+            if not isinstance(resp, RoomGetEventResponse):
+                logger.debug(
+                    "_fetch_quoted_message: unexpected response type for "
+                    "event %s in %s: %s",
+                    event_id,
+                    room_id,
+                    type(resp).__name__,
+                )
+                return None
+
+            event = resp.event
+            content = (
+                event.source.get("content", {})
+                if hasattr(event, "source")
+                else {}
+            )
+            result: Dict[str, Any] = {
+                "sender": getattr(event, "sender", "Unknown"),
+                "body": content.get("body", ""),
+                "event_id": event_id,
+                "msgtype": content.get("msgtype", "m.text"),
+            }
+            msgtype = result["msgtype"]
+            if msgtype in ("m.image", "m.file", "m.audio", "m.video"):
+                result["url"] = content.get("url", "")
+                result["info"] = content.get("info", {})
+                # E2EE: key/iv/hashes live under ``file`` field
+                file_info = content.get("file", {})
+                if file_info:
+                    result["url"] = file_info.get(
+                        "url",
+                        result.get("url", ""),
+                    )
+                    result["key"] = file_info.get("key", {})
+                    result["hashes"] = file_info.get("hashes", {})
+                    result["iv"] = file_info.get("iv", "")
+                    result["encrypted"] = True
+            return result
+        except Exception as exc:
+            logger.debug(
+                "_fetch_quoted_message: error fetching event %s: %s",
+                event_id,
+                exc,
+            )
+        return None
+
+    async def _download_quoted_image(
+        self,
+        quoted: Dict[str, Any],
+    ) -> Optional[str]:
+        """Download an image referenced by a quoted (m.in_reply_to) message.
+
+        Handles both cleartext (``_download_mxc``) and E2EE
+        (``_download_encrypted_mxc``) attachments, and appends a
+        mimetype-derived extension when the saved filename lacks one
+        (e.g. ``image/webp`` → ``.webp``).
+
+        Returns:
+            Local path to the downloaded file, or ``None`` on failure.
+        """
+        q_url = quoted.get("url", "")
+        if not q_url:
+            return None
+        q_info = quoted.get("info", {}) or {}
+        q_mimetype = (
+            q_info.get("mimetype", "image/jpeg")
+            if isinstance(q_info, dict)
+            else "image/jpeg"
+        )
+        original_event_id = quoted.get("event_id", "")
+        q_eid = original_event_id[:8].lstrip("$")
+        q_filename = f"{q_eid}_replied_image"
+        q_ext = mimetypes.guess_extension(q_mimetype)
+        # guess_extension can append a trailing ';' for mime types
+        # with a comment (e.g. webp); strip it.
+        q_ext = q_ext.rstrip(";").strip() if q_ext else ""
+        if q_ext:
+            q_filename += q_ext
+        if quoted.get("encrypted"):
+            return await self._download_encrypted_mxc(
+                q_url,
+                q_filename,
+                quoted.get("key", {}) or {},
+                quoted.get("hashes", {}) or {},
+                quoted.get("iv", "") or "",
+            )
+        return await self._download_mxc(q_url, q_filename)
+
     async def _record_media_history(
         self,
         room: Any,
@@ -1827,6 +1987,21 @@ class MatrixChannel(BaseChannel):
                     eid = event.event_id[:8].lstrip("$")
                     filename = body or f"matrix_media_{eid}"
                     filename = f"{eid}_{filename}"
+                    # Append mimetype extension when filename lacks one
+                    info = getattr(event, "info", None) or {}
+                    media_mimetype = (
+                        info.get("mimetype")
+                        if isinstance(info, dict)
+                        else None
+                    )
+                    _, current_ext = os.path.splitext(filename)
+                    if not current_ext and media_mimetype:
+                        ext = mimetypes.guess_extension(media_mimetype)
+                        # guess_extension can append a trailing ';' when
+                        # the mime type has a comment (e.g. webp).
+                        ext = ext.rstrip(";").strip() if ext else ""
+                        if ext:
+                            filename = f"{filename}{ext}"
                     local_path = await self._download_mxc(mxc_url, filename)
                     if local_path:
                         media_parts.append(
@@ -1842,6 +2017,18 @@ class MatrixChannel(BaseChannel):
                 eid = event.event_id[:8].lstrip("$")
                 filename = body or f"matrix_media_{eid}"
                 filename = f"{eid}_{filename}"
+                info = getattr(event, "info", None) or {}
+                media_mimetype = (
+                    info.get("mimetype") if isinstance(info, dict) else None
+                )
+                _, current_ext = os.path.splitext(filename)
+                if not current_ext and media_mimetype:
+                    ext = mimetypes.guess_extension(media_mimetype)
+                    # guess_extension can append a trailing ';' when
+                    # the mime type has a comment (e.g. webp).
+                    ext = ext.rstrip(";").strip() if ext else ""
+                    if ext:
+                        filename = f"{filename}{ext}"
                 local_path = await self._download_mxc(mxc_url, filename)
                 if local_path:
                     media_parts.append(
@@ -2087,6 +2274,20 @@ class MatrixChannel(BaseChannel):
             eid = event.event_id[:8].lstrip("$")
             filename = body or f"matrix_media_{eid}"
             filename = f"{eid}_{filename}"
+            # Append mimetype extension when filename lacks one — see
+            # _on_room_media_event for the agentscope rationale.
+            info = getattr(event, "info", None) or {}
+            media_mimetype = (
+                info.get("mimetype") if isinstance(info, dict) else None
+            )
+            _, current_ext = os.path.splitext(filename)
+            if not current_ext and media_mimetype:
+                ext = mimetypes.guess_extension(media_mimetype)
+                # guess_extension can append a trailing ';' when the
+                # mime type is registered with a comment (e.g. webp).
+                ext = ext.rstrip(";").strip() if ext else ""
+                if ext:
+                    filename = f"{filename}{ext}"
             local_path = await self._download_encrypted_mxc(
                 mxc_url,
                 filename,
@@ -2457,17 +2658,71 @@ class MatrixChannel(BaseChannel):
         content_parts: list[Any] = [
             TextContent(type=ContentType.TEXT, text=command_text),
         ]
+
+        # Handle quoted message (m.relates_to m.in_reply_to) so the LLM
+        # can see what the user is replying to — text AND any media
+        # (image / file / audio / video), encrypted or cleartext.
+        quoted_prefix = ""
+        quoted_image_path: Optional[str] = None
+        try:
+            event_content = (
+                event.source.get("content", {})
+                if hasattr(event, "source")
+                else {}
+            )
+            relates_to = event_content.get("m.relates_to", {}) or {}
+            if relates_to.get("rel_type") == "m.in_reply_to":
+                original_event_id = relates_to.get("event_id")
+                if original_event_id:
+                    quoted = await self._fetch_quoted_message(
+                        room_id,
+                        original_event_id,
+                    )
+                    if quoted:
+                        quoted_prefix = self._build_quoted_prefix(quoted) or ""
+                        # If the quoted message is an image and vision
+                        # is enabled, download it so the LLM can see it.
+                        if (
+                            quoted.get("msgtype") == "m.image"
+                            and self.vision_enabled
+                        ):
+                            quoted_image_path = (
+                                await self._download_quoted_image(quoted)
+                            )
+        except Exception as exc:
+            logger.debug(
+                "MatrixChannel: quoted-message handling failed: %s",
+                exc,
+            )
+
         is_slash_cmd = command_text.startswith("/")
         if not is_dm and not is_slash_cmd:
             # Prefix sender identity so the LLM can distinguish participants
             sender_name = self._get_display_name(room, sender_id)
             content_parts[0] = TextContent(
                 type=ContentType.TEXT,
-                text=f"{sender_name}: {command_text}",
+                text=f"{quoted_prefix}{sender_name}: {command_text}",
             )
             content_parts = self._apply_history_to_parts(
                 room_id,
                 content_parts,
+            )
+        elif quoted_prefix:
+            # DM or slash command: still surface the quoted text for context
+            content_parts[0] = TextContent(
+                type=ContentType.TEXT,
+                text=f"{quoted_prefix}{command_text}",
+            )
+
+        # If the quoted message carried an image, attach it to the request
+        # so vision-capable models can actually see what the user is asking
+        # about (the common "图片不能读取" symptom).
+        if quoted_image_path:
+            content_parts.append(
+                ImageContent(
+                    type=ContentType.IMAGE,
+                    image_url=Path(quoted_image_path).as_uri(),
+                ),
             )
 
         worker_name = (self._user_id or "").split(":")[0].lstrip("@")
@@ -2552,6 +2807,22 @@ class MatrixChannel(BaseChannel):
             eid = event.event_id[:8].lstrip("$")
             filename = body or f"matrix_media_{eid}"
             filename = f"{eid}_{filename}"
+            # Append a mimetype-based extension if the body filename
+            # doesn't already carry one. agentscope's image loader keys
+            # off the extension, so a body-less image (filename is just
+            # the matrix event id) would otherwise be silently rejected.
+            info = getattr(event, "info", None) or {}
+            media_mimetype = (
+                info.get("mimetype") if isinstance(info, dict) else None
+            )
+            _, current_ext = os.path.splitext(filename)
+            if not current_ext and media_mimetype:
+                ext = mimetypes.guess_extension(media_mimetype)
+                # guess_extension can append a trailing ';' when the
+                # mime type is registered with a comment (e.g. webp).
+                ext = ext.rstrip(";").strip() if ext else ""
+                if ext:
+                    filename = f"{filename}{ext}"
             local_path = await self._download_mxc(mxc_url, filename)
             if local_path:
                 file_uri = Path(local_path).as_uri()

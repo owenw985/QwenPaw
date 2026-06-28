@@ -662,6 +662,393 @@ class TestMatrixChannelMediaCallback:
         matrix_channel._enqueue.assert_not_called()
 
 
+class TestBuildQuotedPrefix:
+    """``_build_quoted_prefix`` covers the 5 matrix msgtype cases.
+
+    Mirrors ``test_yuanbao.py::TestBuildQuotedPrefix`` so channels
+    share one labelling convention for quoted messages.
+    """
+
+    def test_text_quote(self):
+        assert (
+            MatrixChannel._build_quoted_prefix(
+                {"msgtype": "m.text", "body": "hello world"},
+            )
+            == "[quoted message: hello world]"
+        )
+
+    def test_image_quote_with_filename(self):
+        assert (
+            MatrixChannel._build_quoted_prefix(
+                {"msgtype": "m.image", "body": "photo.png"},
+            )
+            == "[quoted image: photo.png]"
+        )
+
+    def test_image_quote_without_filename(self):
+        assert (
+            MatrixChannel._build_quoted_prefix(
+                {"msgtype": "m.image", "body": ""},
+            )
+            == "[quoted image]"
+        )
+
+    def test_file_quote(self):
+        assert (
+            MatrixChannel._build_quoted_prefix(
+                {"msgtype": "m.file", "body": "report.pdf"},
+            )
+            == "[quoted file: report.pdf]"
+        )
+
+    def test_audio_quote(self):
+        assert (
+            MatrixChannel._build_quoted_prefix(
+                {"msgtype": "m.audio", "body": "voice.mp3"},
+            )
+            == "[quoted audio: voice.mp3]"
+        )
+
+    def test_video_quote(self):
+        assert (
+            MatrixChannel._build_quoted_prefix(
+                {"msgtype": "m.video", "body": "clip.mp4"},
+            )
+            == "[quoted video: clip.mp4]"
+        )
+
+    def test_empty_body_falls_back_to_label_only(self):
+        assert (
+            MatrixChannel._build_quoted_prefix(
+                {"msgtype": "m.text", "body": ""},
+            )
+            == "[quoted message]"
+        )
+
+    def test_unknown_msgtype_treated_as_message(self):
+        assert (
+            MatrixChannel._build_quoted_prefix(
+                {"msgtype": "m.location", "body": "park"},
+            )
+            == "[quoted message: park]"
+        )
+
+    def test_non_dict_returns_none(self):
+        assert MatrixChannel._build_quoted_prefix(None) is None
+
+
+@pytest.mark.asyncio
+class TestMatrixChannelQuotedMessage:
+    """Integration tests for m.relates_to m.in_reply_to handling.
+
+    The pure-prefix logic is unit-tested in
+    :class:`TestBuildQuotedPrefix` above; these tests verify that
+    ``_on_room_event`` and ``_on_room_media_event`` wire the
+    prefix / image-download together correctly.
+    """
+
+    @staticmethod
+    def _make_quoted_event(*, msgtype, body, mimetype=None, encrypted=False):
+        ev = MagicMock()
+        ev.event_id = "$origabcdef01"
+        ev.sender = "@alice:example.org"
+        content: dict = {
+            "body": body,
+            "msgtype": msgtype,
+        }
+        if msgtype in ("m.image", "m.file", "m.audio", "m.video"):
+            if encrypted:
+                content["file"] = {
+                    "url": "mxc://example.org/encryptedblob",
+                    "key": {"k": "fakekey"},
+                    "hashes": {"sha256": "fakehash"},
+                    "iv": "fakeiv",
+                }
+            else:
+                content["url"] = "mxc://example.org/clearblob"
+            content["info"] = {"mimetype": mimetype, "size": 1234}
+        ev.source = {"content": content}
+        return ev
+
+    @staticmethod
+    def _make_reply_event(original_event_id, body="what is this?"):
+        ev = MagicMock(spec=RoomMessageText)
+        ev.sender = "@user:example.com"
+        ev.body = body
+        ev.event_id = "$reply12345678"
+        ev.source = {
+            "content": {
+                "body": body,
+                "msgtype": "m.text",
+                "m.relates_to": {
+                    "rel_type": "m.in_reply_to",
+                    "event_id": original_event_id,
+                },
+            },
+        }
+        return ev
+
+    def _prepare_reply(
+        self,
+        matrix_channel,
+        mock_matrix_room,
+        tmp_path,
+        quoted_event,
+        vision_enabled=True,
+        image_bytes=b"PNGDATA",
+    ):
+        """Wire up channel + room for a quoted-reply test."""
+        from nio.responses import RoomGetEventResponse
+
+        matrix_channel._user_id = "@bot:example.com"
+        matrix_channel.vision_enabled = vision_enabled
+        matrix_channel._enqueue = Mock()
+        matrix_channel._send_read_receipt = AsyncMock()
+        matrix_channel._send_typing = AsyncMock()
+        matrix_channel._is_dm_room = AsyncMock(return_value=True)
+        matrix_channel._require_mention = lambda _rid: False
+        matrix_channel._was_mentioned = lambda _ev, _t: True
+        matrix_channel._is_channel_disabled = lambda *a, **kw: False
+        matrix_channel._strip_mention_prefix = lambda text, _room: text
+        matrix_channel._get_display_name = lambda _room, uid: uid.split(":")[
+            0
+        ].lstrip("@")
+        matrix_channel._apply_history_to_parts = lambda _rid, parts: parts
+
+        client = MagicMock()
+        rge = RoomGetEventResponse()
+        rge.event = quoted_event
+        client.room_get_event = AsyncMock(return_value=rge)
+        matrix_channel._client = client
+
+        # Mimic the production filename build so the saved file has
+        # the same suffix the production code would assign.
+        q_mime = (
+            (quoted_event.source or {})
+            .get("content", {})
+            .get("info", {})
+            .get("mimetype", "image/jpeg")
+        )
+        import mimetypes as _mt
+
+        q_ext = _mt.guess_extension(q_mime) or ".bin"
+        q_ext = q_ext.rstrip(";").strip() or ".bin"
+
+        async def fake_download_clear(_mxc_url, filename):
+            dest = tmp_path / filename
+            dest.write_bytes(image_bytes)
+            return str(dest)
+
+        async def fake_download_enc(_mxc_url, filename, *_args):
+            dest = tmp_path / filename
+            dest.write_bytes(image_bytes)
+            return str(dest)
+
+        matrix_channel._download_mxc = AsyncMock(
+            side_effect=fake_download_clear,
+        )
+        matrix_channel._download_encrypted_mxc = AsyncMock(
+            side_effect=fake_download_enc,
+        )
+        mock_matrix_room.room_id = "!room:example.com"
+        return q_ext
+
+    async def test_quoted_image_with_vision_downloads_and_attaches(
+        self,
+        matrix_channel,
+        mock_matrix_room,
+        tmp_path,
+    ):
+        """Reply to an m.image with vision on → prefix + ImageContent."""
+        quoted = self._make_quoted_event(
+            msgtype="m.image",
+            body="photo.png",
+            mimetype="image/png",
+        )
+        self._prepare_reply(
+            matrix_channel,
+            mock_matrix_room,
+            tmp_path,
+            quoted_event=quoted,
+        )
+        ev = self._make_reply_event(quoted.event_id)
+
+        await matrix_channel._on_room_event(mock_matrix_room, ev)
+
+        matrix_channel._enqueue.assert_called_once()
+        parts = matrix_channel._enqueue.call_args[0][0]["content_parts"]
+        images = [p for p in parts if isinstance(p, ImageContent)]
+        texts = [p for p in parts if isinstance(p, TextContent)]
+        assert len(images) == 1, f"expected 1 ImageContent, got {parts}"
+        assert images[0].image_url.endswith(".png"), images[0].image_url
+        # Leading text part carries the prefix with the original body.
+        assert "[quoted image: photo.png]" in (texts[0].text or ""), texts[
+            0
+        ].text
+        matrix_channel._download_mxc.assert_awaited_once()
+        mxc_arg, name_arg = matrix_channel._download_mxc.await_args[0]
+        assert mxc_arg == "mxc://example.org/clearblob"
+        assert name_arg.endswith(".png"), name_arg
+
+    async def test_quoted_text_message_emits_prefix_only(
+        self,
+        matrix_channel,
+        mock_matrix_room,
+        tmp_path,
+    ):
+        """Reply to an m.text → prefix, no media downloaded."""
+        quoted = self._make_quoted_event(
+            msgtype="m.text",
+            body="original body text",
+        )
+        self._prepare_reply(
+            matrix_channel,
+            mock_matrix_room,
+            tmp_path,
+            quoted_event=quoted,
+        )
+        ev = self._make_reply_event(quoted.event_id)
+
+        await matrix_channel._on_room_event(mock_matrix_room, ev)
+
+        matrix_channel._enqueue.assert_called_once()
+        parts = matrix_channel._enqueue.call_args[0][0]["content_parts"]
+        assert not any(isinstance(p, ImageContent) for p in parts), parts
+        assert "[quoted message: original body text]" in (
+            parts[0].text or ""
+        ), parts[0].text
+        matrix_channel._download_mxc.assert_not_awaited()
+        matrix_channel._download_encrypted_mxc.assert_not_awaited()
+
+    async def test_quoted_image_with_vision_off_emits_prefix_only(
+        self,
+        matrix_channel,
+        mock_matrix_room,
+        tmp_path,
+    ):
+        """vision_enabled=False → prefix kept, no image downloaded."""
+        quoted = self._make_quoted_event(
+            msgtype="m.image",
+            body="photo.png",
+            mimetype="image/png",
+        )
+        self._prepare_reply(
+            matrix_channel,
+            mock_matrix_room,
+            tmp_path,
+            quoted_event=quoted,
+            vision_enabled=False,
+        )
+        ev = self._make_reply_event(quoted.event_id)
+
+        await matrix_channel._on_room_event(mock_matrix_room, ev)
+
+        matrix_channel._enqueue.assert_called_once()
+        parts = matrix_channel._enqueue.call_args[0][0]["content_parts"]
+        assert not any(isinstance(p, ImageContent) for p in parts), parts
+        assert "[quoted image: photo.png]" in (parts[0].text or "")
+        matrix_channel._download_mxc.assert_not_awaited()
+        matrix_channel._download_encrypted_mxc.assert_not_awaited()
+
+    async def test_quoted_encrypted_image_uses_decrypt_path(
+        self,
+        matrix_channel,
+        mock_matrix_room,
+        tmp_path,
+    ):
+        """Reply to an E2EE m.image → _download_encrypted_mxc path."""
+        quoted = self._make_quoted_event(
+            msgtype="m.image",
+            body="secret.jpg",
+            mimetype="image/jpeg",
+            encrypted=True,
+        )
+        self._prepare_reply(
+            matrix_channel,
+            mock_matrix_room,
+            tmp_path,
+            quoted_event=quoted,
+        )
+        ev = self._make_reply_event(quoted.event_id)
+
+        await matrix_channel._on_room_event(mock_matrix_room, ev)
+
+        matrix_channel._enqueue.assert_called_once()
+        parts = matrix_channel._enqueue.call_args[0][0]["content_parts"]
+        images = [p for p in parts if isinstance(p, ImageContent)]
+        assert len(images) == 1, parts
+        assert images[0].image_url.endswith(".jpg")
+        matrix_channel._download_encrypted_mxc.assert_awaited_once()
+        matrix_channel._download_mxc.assert_not_awaited()
+        (
+            mxc,
+            name,
+            key,
+            hashes,
+            iv,
+        ) = matrix_channel._download_encrypted_mxc.await_args[0]
+        assert mxc == "mxc://example.org/encryptedblob"
+        assert name.endswith(".jpg")
+        assert key == {"k": "fakekey"}
+        assert hashes == {"sha256": "fakehash"}
+        assert iv == "fakeiv"
+
+    async def test_direct_image_without_body_uses_mimetype_extension(
+        self,
+        matrix_channel,
+        mock_matrix_room,
+        tmp_path,
+    ):
+        """Body-less image → saved file gets mimetype-derived extension.
+
+        Regression test for the agentscope image loader, which keys
+        off the file extension. Without a body, the default filename
+        is ``<eid>_matrix_media_<eid>`` and needs a mimetype-based
+        suffix.
+        """
+        matrix_channel._user_id = "@bot:example.com"
+        matrix_channel.vision_enabled = True
+        matrix_channel._enqueue = Mock()
+        matrix_channel._send_read_receipt = AsyncMock()
+        matrix_channel._send_typing = AsyncMock()
+        matrix_channel._is_dm_room = AsyncMock(return_value=True)
+        matrix_channel._require_mention = lambda _rid: False
+        matrix_channel._was_mentioned = lambda _ev, _t: True
+        matrix_channel._is_channel_disabled = lambda *a, **kw: False
+        matrix_channel._get_display_name = lambda _r, uid: uid.split(":")[
+            0
+        ].lstrip("@")
+        matrix_channel._apply_history_to_parts = lambda _rid, parts: parts
+
+        event = MagicMock(spec=RoomMessageImage)
+        event.sender = "@user:example.com"
+        event.url = "mxc://example.org/blob_no_body"
+        event.body = ""
+        event.event_id = "$img_evt_0001"
+        event.info = {"mimetype": "image/webp", "size": 999}
+        mock_matrix_room.room_id = "!room:example.com"
+
+        captured: dict = {}
+
+        async def fake_download(_mxc_url, filename):
+            captured["filename"] = filename
+            dest = tmp_path / filename
+            dest.write_bytes(b"WEBPDATA")
+            return str(dest)
+
+        matrix_channel._download_mxc = AsyncMock(side_effect=fake_download)
+        matrix_channel._media_dir = lambda: tmp_path
+
+        await matrix_channel._on_room_media_event(mock_matrix_room, event)
+
+        matrix_channel._enqueue.assert_called_once()
+        assert captured["filename"].endswith(".webp"), captured["filename"]
+        parts = matrix_channel._enqueue.call_args[0][0]["content_parts"]
+        images = [p for p in parts if isinstance(p, ImageContent)]
+        assert len(images) == 1
+        assert images[0].image_url.endswith(".webp")
+
+
 @pytest.mark.asyncio
 class TestMatrixChannelStartStop:
     """Test start and stop lifecycle."""
